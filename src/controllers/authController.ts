@@ -12,6 +12,7 @@ const SALT_ROUNDS = 10;
 
 const JWT_SECRET = process.env.JWT_SECRET;
 const JWT_EXPIRATION = '7d';
+const REFRESH_TOKEN_EXPIRATION = '30d';
 
 if (!JWT_SECRET) {
     throw new Error('FATAL ERROR: JWT_SECRET is not defined.');
@@ -25,10 +26,14 @@ const generateHealthID = () => `${HEALTH_ID_PREFIX}${uuidv4()}`;
 // SIGNUP CONTROLLER
 // -----------------------------------------------------
 const signup = async (req: Request, res: Response) => {
-    const { email, password, firstName, lastName } = req.body;
+    const { email, password, firstName, lastName, phoneNumber, gender } = req.body;
 
     if (!email || !password || !firstName || !lastName) {
         return res.status(400).json({ error: 'All fields (email, password, firstName, lastName) are required.' });
+    }
+
+    if (gender && !['male', 'female', 'other'].includes(gender)) {
+        return res.status(400).json({ error: 'Gender must be male, female, or other.' });
     }
 
     const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -42,14 +47,14 @@ const signup = async (req: Request, res: Response) => {
         await db.query('BEGIN');
 
         const userResult = await db.query(
-            'INSERT INTO users(email, password_hash) VALUES($1, $2) RETURNING user_id',
-            [email, passwordHash]
+            'INSERT INTO users(email, password_hash, phone_number) VALUES($1, $2, $3) RETURNING user_id',
+            [email, passwordHash, phoneNumber || null]
         );
         const userId = userResult.rows[0].user_id;
 
         await db.query(
-            'INSERT INTO user_profiles(user_id, first_name, last_name) VALUES($1, $2, $3)',
-            [userId, firstName, lastName]
+            'INSERT INTO user_profiles(user_id, first_name, last_name, gender) VALUES($1, $2, $3, $4)',
+            [userId, firstName, lastName, gender || null]
         );
 
         const healthId = generateHealthID();
@@ -109,13 +114,23 @@ const login = async (req: Request, res: Response) => {
             return res.status(500).json({ error: 'Server is missing JWT_SECRET. Contact admin.' });
         }
 
-        const token = jwt.sign(
+        const accessToken = jwt.sign(
             { userId: user.user_id, email: user.email },
             JWT_SECRET,
             { expiresIn: JWT_EXPIRATION }
         );
 
-        return res.status(200).json({ token, userId: user.user_id });
+        const refreshToken = jwt.sign(
+            { userId: user.user_id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: REFRESH_TOKEN_EXPIRATION }
+        );
+
+        return res.status(200).json({
+            userId: user.user_id,
+            accessToken,
+            refreshToken
+        });
 
     } catch (error) {
         console.error('Login error:', error);
@@ -123,4 +138,158 @@ const login = async (req: Request, res: Response) => {
     }
 };
 
-export { signup, login };
+// -----------------------------------------------------
+// VERIFY OTP CONTROLLER
+// -----------------------------------------------------
+const verifyOtp = async (req: Request, res: Response) => {
+    const { email, otp } = req.body;
+
+    if (!email || !otp) {
+        return res.status(400).json({ error: 'Email and OTP are required.' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Invalid email format.' });
+    }
+
+    try {
+        const otpResult = await db.query(
+            'SELECT user_id, otp, expires_at FROM otp_verification WHERE email = $1 ORDER BY created_at DESC LIMIT 1',
+            [email]
+        );
+
+        if (otpResult.rows.length === 0) {
+            return res.status(400).json({ error: 'No OTP found for this email.' });
+        }
+
+        const otpRecord = otpResult.rows[0];
+
+        if (new Date() > new Date(otpRecord.expires_at)) {
+            return res.status(400).json({ error: 'OTP has expired.' });
+        }
+
+        if (otpRecord.otp !== otp) {
+            return res.status(400).json({ error: 'Invalid OTP.' });
+        }
+
+        await db.query('DELETE FROM otp_verification WHERE email = $1', [email]);
+
+        return res.status(200).json({ message: 'OTP verified successfully.' });
+
+    } catch (error) {
+        console.error('OTP verification error:', error);
+        return res.status(500).json({ error: 'Server error during OTP verification.' });
+    }
+};
+
+// -----------------------------------------------------
+// CONFIRM PASSWORD RESET CONTROLLER
+// -----------------------------------------------------
+const confirmPasswordReset = async (req: Request, res: Response) => {
+    const { email, otp, newPassword } = req.body;
+
+    if (!email || !otp || !newPassword) {
+        return res.status(400).json({ error: 'Email, OTP, and new password are required.' });
+    }
+
+    if (newPassword.length < 8) {
+        return res.status(400).json({ error: 'Password must be at least 8 characters long.' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Invalid email format.' });
+    }
+
+    try {
+        const otpResult = await db.query(
+            'SELECT user_id, otp, expires_at FROM otp_verification WHERE email = $1 ORDER BY created_at DESC LIMIT 1',
+            [email]
+        );
+
+        if (otpResult.rows.length === 0) {
+            return res.status(400).json({ error: 'No OTP found for this email.' });
+        }
+
+        const otpRecord = otpResult.rows[0];
+
+        if (new Date() > new Date(otpRecord.expires_at)) {
+            return res.status(400).json({ error: 'OTP has expired.' });
+        }
+
+        if (otpRecord.otp !== otp) {
+            return res.status(400).json({ error: 'Invalid OTP.' });
+        }
+
+        const passwordHash = await bcrypt.hash(newPassword, SALT_ROUNDS);
+
+        await db.query('BEGIN');
+
+        await db.query(
+            'UPDATE users SET password_hash = $1 WHERE email = $2',
+            [passwordHash, email]
+        );
+
+        await db.query('DELETE FROM otp_verification WHERE email = $1', [email]);
+
+        await db.query('COMMIT');
+
+        return res.status(200).json({ message: 'Password reset successfully.' });
+
+    } catch (error) {
+        await db.query('ROLLBACK');
+        console.error('Password reset error:', error);
+        return res.status(500).json({ error: 'Server error during password reset.' });
+    }
+};
+
+// -----------------------------------------------------
+// REFRESH TOKEN CONTROLLER
+// -----------------------------------------------------
+const refreshToken = async (req: Request, res: Response) => {
+    const { refreshToken: token } = req.body;
+
+    if (!token) {
+        return res.status(400).json({ error: 'Refresh token is required.' });
+    }
+
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET) as any;
+        
+        const userResult = await db.query(
+            'SELECT user_id, email FROM users WHERE user_id = $1',
+            [decoded.userId]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(401).json({ error: 'Invalid refresh token.' });
+        }
+
+        const user = userResult.rows[0];
+
+        const newAccessToken = jwt.sign(
+            { userId: user.user_id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: JWT_EXPIRATION }
+        );
+
+        const newRefreshToken = jwt.sign(
+            { userId: user.user_id, email: user.email },
+            JWT_SECRET,
+            { expiresIn: REFRESH_TOKEN_EXPIRATION }
+        );
+
+        return res.status(200).json({
+            userId: user.user_id,
+            accessToken: newAccessToken,
+            refreshToken: newRefreshToken
+        });
+
+    } catch (error) {
+        console.error('Refresh token error:', error);
+        return res.status(401).json({ error: 'Invalid refresh token.' });
+    }
+};
+
+export { signup, login, verifyOtp, confirmPasswordReset, refreshToken };
