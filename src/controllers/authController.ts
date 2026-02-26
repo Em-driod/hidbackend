@@ -139,6 +139,60 @@ const login = async (req: Request, res: Response) => {
 };
 
 // -----------------------------------------------------
+// SEND OTP CONTROLLER
+// -----------------------------------------------------
+const sendOtp = async (req: Request, res: Response) => {
+    const { email } = req.body;
+
+    if (!email) {
+        return res.status(400).json({ error: 'Email is required.' });
+    }
+
+    const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+    if (!emailRegex.test(email)) {
+        return res.status(400).json({ error: 'Invalid email format.' });
+    }
+
+    try {
+        // Check if user exists
+        const userResult = await db.query(
+            'SELECT user_id FROM users WHERE email = $1',
+            [email]
+        );
+
+        if (userResult.rows.length === 0) {
+            return res.status(404).json({ error: 'No account found with this email.' });
+        }
+
+        // Generate 6-digit OTP
+        const otp = Math.floor(100000 + Math.random() * 900000).toString();
+        const expiresAt = new Date(Date.now() + 10 * 60 * 1000); // 10 minutes
+
+        // Delete any existing OTPs for this email
+        await db.query('DELETE FROM otp_verification WHERE email = $1', [email]);
+
+        // Store new OTP
+        await db.query(
+            'INSERT INTO otp_verification (email, otp, expires_at) VALUES ($1, $2, $3)',
+            [email, otp, expiresAt]
+        );
+
+        // TODO: Send OTP via email service (for now, return in response for development)
+        console.log(`OTP for ${email}: ${otp}`); // Remove in production
+
+        return res.status(200).json({ 
+            message: 'OTP sent successfully.',
+            // Remove otp in production, only for development
+            otp: process.env.NODE_ENV === 'development' ? otp : undefined
+        });
+
+    } catch (error) {
+        console.error('Send OTP error:', error);
+        return res.status(500).json({ error: 'Server error sending OTP.' });
+    }
+};
+
+// -----------------------------------------------------
 // VERIFY OTP CONTROLLER
 // -----------------------------------------------------
 const verifyOtp = async (req: Request, res: Response) => {
@@ -292,4 +346,4 @@ const refreshToken = async (req: Request, res: Response) => {
     }
 };
 
-export { signup, login, verifyOtp, confirmPasswordReset, refreshToken };
+export { signup, login, sendOtp, verifyOtp, confirmPasswordReset, refreshToken };
