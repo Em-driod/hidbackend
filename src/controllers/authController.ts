@@ -1,12 +1,11 @@
 // src/controllers/authController.ts
 
-
-
 import { Request, Response } from 'express';
 import db from '../db';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { v4 as uuidv4 } from 'uuid';
+import nodemailer from 'nodemailer';
 
 const SALT_ROUNDS = 10;
 
@@ -18,6 +17,17 @@ if (!JWT_SECRET) {
     throw new Error('FATAL ERROR: JWT_SECRET is not defined.');
 }
 const HEALTH_ID_PREFIX = 'HID-';
+
+// Email transporter setup
+const transporter = nodemailer.createTransport({
+    host: process.env.EMAIL_HOST,
+    port: parseInt(process.env.EMAIL_PORT || '587'),
+    secure: false,
+    auth: {
+        user: process.env.EMAIL_USER,
+        pass: process.env.EMAIL_PASS,
+    },
+});
 
 // Helper to generate user HEALTH ID
 const generateHealthID = () => `${HEALTH_ID_PREFIX}${uuidv4()}`;
@@ -177,11 +187,34 @@ const sendOtp = async (req: Request, res: Response) => {
             [email, otp, expiresAt]
         );
 
-        // TODO: Send OTP via email service (for now, return in response for development)
-        console.log(`OTP for ${email}: ${otp}`); // Remove in production
+        // Send OTP via email
+        try {
+            await transporter.sendMail({
+                from: process.env.EMAIL_USER,
+                to: email,
+                subject: 'Your OTP Code - Health ID',
+                html: `
+                    <div style="font-family: Arial, sans-serif; max-width: 600px; margin: 0 auto;">
+                        <h2 style="color: #333;">Health ID - OTP Verification</h2>
+                        <p>Your One-Time Password (OTP) is:</p>
+                        <div style="background: #f4f4f4; padding: 20px; text-align: center; border-radius: 8px; margin: 20px 0;">
+                            <span style="font-size: 32px; font-weight: bold; color: #007bff;">${otp}</span>
+                        </div>
+                        <p>This OTP will expire in 10 minutes.</p>
+                        <p style="color: #666; font-size: 14px;">If you didn't request this OTP, please ignore this email.</p>
+                    </div>
+                `,
+            });
+        } catch (emailError) {
+            console.error('Failed to send email:', emailError);
+            // Fallback: return OTP in development
+            if (process.env.NODE_ENV === 'development') {
+                console.log(`OTP for ${email}: ${otp}`);
+            }
+        }
 
         return res.status(200).json({ 
-            message: 'OTP sent successfully.',
+            message: 'OTP sent successfully to your email.',
             // Remove otp in production, only for development
             otp: process.env.NODE_ENV === 'development' ? otp : undefined
         });
